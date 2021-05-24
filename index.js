@@ -1,15 +1,9 @@
-const DirectusSDK = require("@directus/sdk-js");
+const { Directus } = require("@directus/sdk");
 const fs = require('fs');
-const path = require('path');
+const axios = require('axios');
 
-/**
- * Convert `const http` to variable to change protocol from project options
- */
-let http = require('https');
-/**
- * Default upload image path
- */
-let uploadImagesDir = './.cache-directus/img-cache'
+
+// TODO ADD CLEANUP OF UNUSED IMAGES / FILES
 
 const imageTypes = [
   'image/jpeg',
@@ -17,284 +11,348 @@ const imageTypes = [
   'image/png',
   'image/gif',
 ]
-
-// TODO ADD CLEANUP OF UNUSED IMAGES / FILES
-let download = async (url, dest, dir = uploadImagesDir) => {
-  
-  var imgName = dest;
-
-  if (!fs.existsSync('./.cache-directus')){
-    fs.mkdirSync('./.cache-directus');
+const defaultOptions = {
+  queryParams: {
+    limit: -1,
+    fields: '*'
   }
+}
 
+function mkDir (dir) {
   if (!fs.existsSync(dir)){
-      fs.mkdirSync(dir);
+    fs.mkdirSync(dir);
   }
+}
+function writeStreamToDest (stream, dest) {
+  const file = fs.createWriteStream(dest)
 
-  dest = dir + '/' + dest;
+  return new Promise(function (resolve, reject) {
+    stream.pipe(file)
+    file.on('finish', () => {
+      resolve()
+    })
+  })
+}
+async function download (url, dest, token, dir) {
 
-  var cleanImageName = path.resolve(dest);
+  let imgName = dest;
 
-  if (fs.existsSync(dest)) return cleanImageName;
+  mkDir('./src/assets/static/.cache-directus') // for cache
+  mkDir(dir) // for images
 
+  const cacheDest = `${dir}/${dest}`
   console.log(' -- Downloading Resource: ' + imgName);
 
-  return new Promise((resolve, reject) => {
-    var file = fs.createWriteStream(dest);
-    http.get(url, function(response) {
-      response.pipe(file);
-      file.on('finish', function() {
-        resolve(cleanImageName);
-      });
-    }).on('error', function(err) {
-      fs.unlink(dest);
-      reject(err.message);
-    });
-  });  
-};
-
-function sanitizeFields(fields) {
-  Object.keys(fields).forEach((key) => { 
-    if(fields[key] === null || fields[key] === undefined) {
-      delete fields[key];
-    }
-  });
-  return fields;
-}
-
-function sanitizeItem(fields) {
-  let { id, title, slug, path, date, content, excerpt } = fields;
-
-  let _id = id.toString();
-
-  delete fields.id;
-  fields._directusID = _id;
-
-  return sanitizeFields(fields);
-}
-
-/**
- * Convert nested object to flat object
- * https://stackoverflow.com/questions/34513964/how-to-convert-this-nested-object-into-a-flat-object
- * */
-function traverseAndFlatten(currentNode, target, flattenedKey) {
-  for (var key in currentNode) {
-    if (currentNode.hasOwnProperty(key)) {
-      var newKey;
-      if (flattenedKey === undefined) {
-        newKey = key;
-      } else {
-        newKey = flattenedKey + '__' + key;
+  if (!fs.existsSync(cacheDest)) {
+    const stream = await axios.get(url, {
+      responseType: "stream",
+      headers: {
+        "Authorization": token
       }
+    })
+    await writeStreamToDest(stream.data, cacheDest)
+    console.log(' -- Resource loaded')
+  } else
+    console.log(' -- Resource is already loaded ')
 
-      var value = currentNode[key];
-      if (typeof value === "object") {
-        traverseAndFlatten(value, target, newKey);
-      } else {
-        target[newKey] = value;
-      }
-    }
-  }
-}
-
-function flatten(obj) {
-  var flattenedObject = {};
-  traverseAndFlatten(obj, flattenedObject);
-  return flattenedObject;
-}
-/**
- * End. https://stackoverflow.com/questions/34513964/how-to-convert-this-nested-object-into-a-flat-object
- * */
-
-async function checkForImages(item) {
-
-  for(const itemKey in item) {
-    const itemContent = item[itemKey];
-    if(itemContent && itemContent.type && imageTypes.includes(itemContent.type)) {
-      item[itemKey].gridsome_image = await download(itemContent.data.full_url, itemContent.filename_disk);
-    } else if(itemContent && itemKey !== 'owner' && typeof itemContent === 'object' && Object.keys(itemContent).length > 0) {
-      item[itemKey] = await checkForImages(itemContent);
-    }
-  }
-
-  return item;
-}
-
-async function checkForDownloads(item) {
-
-  for(const itemKey in item) {
-    const itemContent = item[itemKey];
-    if(itemContent && itemContent.type && itemContent.data) {
-      item[itemKey].gridsome_link = await download(itemContent.data.full_url, itemContent.filename_disk, './.cache-directus/file-cache');
-    } else if(itemContent && itemKey !== 'owner' && typeof itemContent === 'object' && Object.keys(itemContent).length > 0) {
-      item[itemKey] = await checkForDownloads(itemContent);
-    }
-  }
-
-  return item;
+  return cacheDest.replace('./src/assets', '~/assets');
 }
 
 class DirectusSource {
-  static defaultOptions () {
-    return {
-      typeName: 'Directus',
-      apiUrl: undefined,
-      project: '_',
-      staticToken: undefined,
-      email: undefined,
-      password: undefined,
-      maxRetries: 3,
-      reconnectTimeout: 10000,
-      collections: []
-    }
-  }
 
   constructor (api, options) {
     this.api = api;
     this.options = options;
+    this.client = null;
+    this.GSStore = null;
+    this.GSCollections = {};
+    this.directusNameToCollectionName = {};
+    this.GSCollectionsData = {};
 
-    /**
-     * Options for setting download protocol && images upload directory
-     */
-    if( options.global ) {
-      if( options.global.protocol ) {
-        http = require(options.global.protocol)
-      }
-      if( options.global.uploadImagesDir ) {
-        uploadImagesDir = options.global.uploadImagesDir
-      }
-    }
+
     api.loadSource(args => this.fetchContent(args));
   }
 
+  async initClientDirectus () {
+    this.client = new Directus(this.options.apiUrl)
+
+    await this.connect()
+
+    this.clientCollections = await this.client.collections.readMany()
+  }
+  async connect () {
+    try {
+      const {email, password} = this.options
+      await this.client.auth.login(Object.assign({ email, password, persist: false }))
+    } catch (e) {
+      this.error(`Can not login to Directus, ${e}`)
+    }
+  }
+
   async fetchContent (store) {
-    const { addCollection, getContentType, slugify } = store
-    const { apiUrl, project, staticToken, email, password, collections, maxRetries, reconnectTimeout } = this.options
 
-    const directusOptions = {
-      url: apiUrl,
-      project: project,
-      token: staticToken
-    };
-    
-    const client = new DirectusSDK(directusOptions);
+    await this.initClientDirectus()
+    this.GSStore = store
 
-    let retries = 0;
+    const { apiUrl, collections } = this.options
 
-    let connect = async () => {
-      return new Promise(async (resolve, reject) => {
-          try {
-            await client.login(Object.assign({ email, password, persist: false }, directusOptions));
-            
-            resolve(await client.getCollections());
-          } catch (e) {
-            console.error("DIRECTUS ERROR: Can not login to Directus", e);
-  
-            if(retries < maxRetries) {
-              retries++;
-              console.log("DIRECTUS - Retrying to connect in 10 seconds...");
-  
-              setTimeout(async () => {
-                await connect();
-              }, reconnectTimeout);
-            } else {
-              reject(process.exit(1))
-              throw new Error("DIRECTUS ERROR: Can not login to Directus");
-            }          
-          }
-      });      
-    }    
-    
-    if(email && password) {
-      let data = await connect();  
+    const GSCollections = this.GSCollections
+    const GSCollectionsData = this.GSCollectionsData
+
+    this.logInfo(`Loading data from Directus at: ${apiUrl}`)
+
+    if(collections.length <= 0)
+      this.error('No Directus collections specified!')
+
+    this.logInfo('Create Gridsome collections')
+
+    this.addGSCollections()
+
+    this.logInfo('DONE')
+
+
+    this.logInfo('Setting up links between collections')
+
+    this.setGSCollectionsReference()
+
+    this.logInfo('DONE')
+
+
+    this.logInfo('Data preparation for collection')
+
+    await this.loadGSCollectionsData()
+
+    this.logInfo('DONE')
+
+
+    this.logInfo('Setting up connections between data')
+
+    this.updateReferenceFieldsForData()
+
+    this.logInfo('DONE')
+
+
+    this.logInfo('Adding data to the collection')
+
+    this.addDataToGSCollections()
+
+    this.logInfo('DONE')
+
+    this.logSuccess("Loading done!");
+    await this.client.auth.logout();
+  }
+
+  addGSCollections () {
+    const { collections } = this.options
+    const { addCollection } = this.GSStore
+
+    for (const collection of collections) {
+      this.GSCollections[collection.name] = addCollection({
+        typeName: collection.name
+      })
+      this.directusNameToCollectionName[collection.directusPathName] = collection.name
     }
-    
-    console.log("DIRECTUS: Loading data from Directus at: " + apiUrl);
-
-    if(collections.length <= 0) {
-      console.error("DIRECTUS ERROR: No Directus collections specified!");
-      process.exit(1)
-      throw new Error("DIRECTUS ERROR: No Directus collections specified!");
-    }
+  }
+  setGSCollectionsReference () {
+    const { collections } = this.options
 
     for(const collection of collections) {
-      let collectionName;
-      let params;
-      let directusPathName;
-      if(typeof collection === 'object') {
-        collectionName = collection.name;
-        directusPathName = collection.directusPathName || collectionName
-        delete collection.name;
-        params = collection;
-      } else {
-        collectionName = collection;
+      const GSCollection = this.GSCollections[collection.name]
+
+      if (collection.hasOwnProperty('refs')) {
+        for (const ref of collection.refs) {
+          if (!ref.hasOwnProperty('collectionName'))
+            this.error('The collection refs is not configured correctly (check the refs)')
+
+          let collectionNames = null
+          if (!Array.isArray(ref.collectionName)) {
+            GSCollection.addReference(ref.field, ref.collectionName)
+            collectionNames = [ref.collectionName]
+          } else {
+            collectionNames = ref.collectionName
+          }
+
+          if (ref.hasOwnProperty('relatedField')) {
+            collectionNames.forEach(collectionName => {
+              const relatedGSCollection = this.GSCollections[collectionName]
+              relatedGSCollection.addReference(ref.relatedField, collection.name)
+            })
+          }
+        }
       }
-      
-      try {
-        if(!params.limit) {
-          params.limit = -1;
+    }
+  }
+  async loadGSCollectionsData () {
+    const { collections } = this.options
+
+    for (const collection of collections) {
+
+
+      const data = await this.getCollectionItems(collection)
+
+      this.GSCollectionsData[collection.name] = {}
+
+      for(let item of data) {
+        if (collection.hasOwnProperty('downloadImages') && collection.downloadImages)
+          item = await this.getImages(item);
+
+        if(collection.hasOwnProperty('downloadFiles') && collection.downloadFiles)
+          item = await this.getFiles(item);
+
+        this.GSCollectionsData[collection.name][item.id] = item
+      }
+
+    }
+  }
+  updateReferenceFieldsForData () {
+    const { collections } = this.options
+
+    for (const collection of collections) {
+
+      for (const itemId in this.GSCollectionsData[collection.name]) {
+
+        if (collection.hasOwnProperty('refs')) {
+          this.setReference(this.GSCollectionsData[collection.name][itemId], collection.refs)
         }
+      }
+    }
+  }
+  addDataToGSCollections () {
+    for (const collectionName in this.GSCollections) {
+      for (const dataId in this.GSCollectionsData[collectionName]) {
+        const item = this.GSCollectionsData[collectionName][dataId]
+        this.GSCollections[collectionName].addNode(item)
+      }
+    }
+  }
 
-        let data = await client.getItems(directusPathName, params);
-        data = data.data;
+  async getCollectionItems (collection) {
 
-        let route;
+    if (!collection.hasOwnProperty('name'))
+      this.error('The collection cannot be identified (the name field is missing)')
 
-        if(params) {
-          if(params.hasRoute) {
-            route = `/${slugify(collectionName)}/:slug`;
-          } else if(params.route) {
-            if(typeof params.route === 'function') {
-              route = params.route(collectionName, collection, slugify);
-            } else {
-              route = params.route;
-            }
-          }
-        }
-        
-        const contentType = addCollection({
-          typeName: collectionName, // TODO change name creation
-          route: route
-        })
-        
-        for(let item of data) {
+    if (!collection.hasOwnProperty('queryParams'))
+      collection.queryParams = defaultOptions.queryParams
+    else if (!collection.queryParams.hasOwnProperty('limit'))
+      collection.queryParams.limit = -1;
 
-          if(params.downloadImages) {
-            item = await checkForImages(item);
-          }
+    try {
+      const response = await this.client.items(collection.directusPathName || collection.name).readMany({
+        ...collection.queryParams
+      });
 
-          if(params.downloadFiles) {
-            item = await checkForDownloads(item);
-          }
+      return collection.singleton? [response.data] : response.data
+    } catch (e) {
+      this.error(`Can not load data for collection '${collection.name}' \n\n ${e}`)
+    }
+  }
+  async getImages (item) {
+    for(const itemKey in item) {
+      const itemContent = item[itemKey];
 
-          /**
-           * Convert nested object to flat object
-           */
-          if( params.flat ) {
-            item = flatten(item);
-          }
+      if(itemContent && itemContent.type && imageTypes.includes(itemContent.type))
+        item[itemKey].gridsome_image = await download(
+            `${this.options.apiUrl}assets/${itemContent.id}`,
+            itemContent.filename_disk,
+            'Bearer ' + this.client.auth.token,
+            './src/assets/static/.cache-directus/img-cache');
 
-          /**
-           * Check if params.sanitizeID === false to sanitize Node ID or not
-           */
-          if( params.sanitizeID === false ) {
-            contentType.addNode(sanitizeFields(item))
-          }
-          else {
-            contentType.addNode(sanitizeItem(item))
-          }
-        }
+      else if(itemContent && itemKey !== 'owner' && typeof itemContent === 'object' && Object.keys(itemContent).length > 0)
+        item[itemKey] = await this.getImages(itemContent);
 
-      } catch (e) {
-        console.error("DIRECTUS ERROR: Can not load data for collection '", e);
-        process.exit(1)
-        throw "DIRECTUS ERROR: Can not load data for collection '" + collectionName + "'!";
+    }
+
+    return item;
+  }
+  async getFiles (item) {
+    for(const itemKey in item) {
+      const itemContent = item[itemKey];
+      if(itemContent && itemContent.type && itemContent.data) {
+        item[itemKey].gridsome_link = await download(
+            `${this.options.apiUrl}files/${itemContent.id}`,
+            itemContent.filename_disk,
+            'Bearer ' + this.client.auth.token,
+            './src/assets/static/.cache-directus/file-cache');
+
+      } else if(itemContent && itemKey !== 'owner' && typeof itemContent === 'object' && Object.keys(itemContent).length > 0) {
+        item[itemKey] = await this.getFiles(itemContent);
       }
     }
 
-    console.log("DIRECTUS: Loading done!");
-    client.logout();
+    return item;
+  }
 
+
+  getRefIds(item, source) {
+    const pathParse = source.split('.')
+    const now = pathParse.shift()
+
+    if (pathParse.length === 0)
+      return Array.isArray(item[now])? item[now]: [item[now]]
+
+    if (Array.isArray(item[now]))
+      return item[now].reduce((refIds, i) => refIds.concat(this.getRefIds(i, pathParse.join('.'))), [])
+
+    return this.getRefIds(item[now], pathParse.join('.'))
+  }
+  setReference(item, refs) {
+    for (const ref of refs) {
+      const {source, field} = ref
+
+      const refIds = this.getRefIds(item, source)
+      delete item[source.split('.')[0]]
+
+      item[field] = []
+
+      for (const refId of refIds) {
+        if (refId) {
+          const collectionName = typeof refId === 'object' ? this.directusNameToCollectionName[refId.collection] : ref.collectionName;
+          const dataId = typeof refId === 'object' ? Number.parseInt(refId.item) : refId;
+
+          if (collectionName && dataId) {
+            item[field + '__collection'] = collectionName
+            item[field].push(dataId)
+          }
+
+        }
+      }
+
+      if (ref.hasOwnProperty('relatedField')) {
+
+        for (const refId of refIds) {
+          if (refId) {
+            const collectionName = typeof refId === 'object' ? this.directusNameToCollectionName[refId.collection] : ref.collectionName;
+
+            const dataId = typeof refId === 'object' ? Number.parseInt(refId.item) : refId;
+            if (collectionName && dataId) {
+              const relatedGSCollectionData = this.GSCollectionsData[collectionName]
+
+              if (relatedGSCollectionData && relatedGSCollectionData.hasOwnProperty(dataId)) {
+                const relatedItem = relatedGSCollectionData[dataId]
+                if (relatedItem.hasOwnProperty(ref.relatedField))
+                  relatedItem[ref.relatedField].push(item.id)
+                else
+                  relatedItem[ref.relatedField] = [item.id]
+
+              }
+            }
+
+          }
+        }
+
+      }
+    }
+  }
+
+  error (msg) {
+    console.error(`DIRECTUS ERROR: ${msg}`);
+    process.exit(1)
+  }
+  logSuccess (msg) {
+    console.log(`%c DIRECTUS SUCCESS: ${msg}`, 'color: green;');
+  }
+  logInfo (msg) {
+    console.log(`%c DIRECTUS: ${msg}`, 'color: blue;');
   }
 }
 

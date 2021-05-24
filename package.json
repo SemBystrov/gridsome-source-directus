@@ -17,6 +17,12 @@
     "name": "Dominik Friedrich",
     "url": "https://rocket.works"
   },
+  "contributors": [
+    {
+      "email": "sembystrov14@gmail.com",
+      "name": "Semjon Bystrov"
+    }
+  ],
   "homepage": "https://rocket.works",
   "license": "MIT",
   "keywords": [
@@ -26,6 +32,7 @@
     "directus"
   ],
   "dependencies": {
-    "@directus/sdk-js": "^5.0.0"
+    "@directus/sdk": "^9.0.0-rc.57",
+    "axios": "^0.21.1"
   }
 }
